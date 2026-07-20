@@ -19,6 +19,9 @@
     "ts-node-dev": "^1.1.8",
     "typescript": "4.2.3"
   },
+  "devDependencies": {
+    "socket.io-client": "4.8.1"
+  },
   "license": "MIT",
   "main": "dist/index.js",
   "name": "excalidraw-portal",
@@ -33,7 +36,10 @@
     "start:dev": "cross-env NODE_ENV=development ts-node-dev --respawn --transpile-only src/index.ts",
     "test:code": "eslint --ext .ts .",
     "test:other": "yarn prettier --list-different",
-    "test": "yarn test:other && yarn test:code"
+    "test:vault:remote": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/vault-room-remote-gate.ps1",
+    "test:vault:real": "yarn build && node scripts/vault-room-real-gate.cjs",
+    "test:vault": "node -r ts-node/register/transpile-only src/vault.test.ts",
+    "test": "yarn test:other && yarn test:code && yarn test:vault"
   },
   "version": "1.0.0"
 }
