@@ -3,7 +3,18 @@ import https from "https";
 import { randomBytes, timingSafeEqual } from "crypto";
 
 export const VAULT_PROTOCOL_VERSION = 1 as const;
+/** P4c CRDT protocol (ADR 0030 §3, W2 design) */
+export const VAULT_PROTOCOL_VERSION_V2 = 2 as const;
+/** protocol versions this server can relay (advertised by /vault/capabilities) */
+export const VAULT_SUPPORTED_PROTOCOL_VERSIONS = [
+  VAULT_PROTOCOL_VERSION,
+  VAULT_PROTOCOL_VERSION_V2,
+] as const;
 export const VAULT_DEPLOYMENT_VERSION = "p4a-f4-v1" as const;
+/**
+ * Kept at 1 on purpose: deployed v1 clients require `roomServerVersion === 1`.
+ * v2 support is advertised through `protocolVersions` instead (W2 S-7).
+ */
 export const VAULT_ROOM_SERVER_VERSION = 1 as const;
 export const VAULT_SOCKET_EVENTS = {
   join: "vault:join",
@@ -29,6 +40,17 @@ export interface VaultSocketJoinRequest {
   senderSessionId: string;
 }
 
+/** v2 join: no sender session id (W2 S-1) */
+export interface VaultSocketJoinRequestV2 {
+  protocolVersion: typeof VAULT_PROTOCOL_VERSION_V2;
+  vaultId: string;
+  invitationCapability: string;
+}
+
+export type VaultAnySocketJoinRequest =
+  | VaultSocketJoinRequest
+  | VaultSocketJoinRequestV2;
+
 export interface VaultRoomProvisionRequest {
   protocolVersion: typeof VAULT_PROTOCOL_VERSION;
   vaultId: string;
@@ -48,6 +70,8 @@ export interface VaultCapabilityResolution {
   activeRoomId: string;
   snapshotGeneration: number;
   expiresAt: number | null;
+  /** the Vault's own protocol version (v2 resolver only, W2 S-2) */
+  protocolVersion?: number;
 }
 
 export interface VaultCapabilityDisconnectNotice {
@@ -85,18 +109,41 @@ export interface VaultRealtimeEnvelope {
   ciphertext: string;
 }
 
+/** v2 outer envelope: exact 13 fields, no session id / sequence (W2 §2, S-3) */
+export interface VaultRealtimeEnvelopeV2 {
+  version: typeof VAULT_PROTOCOL_VERSION_V2;
+  schemaVersion: 2;
+  protocolVersion: typeof VAULT_PROTOCOL_VERSION_V2;
+  vaultId: string;
+  roomId: string;
+  purpose: "realtime.content" | "realtime.request" | "realtime.presence";
+  messageType:
+    | "sync.update"
+    | "sync.context"
+    | "sync.snapshot-request"
+    | "presence.ephemeral";
+  messageId: string;
+  generation: number;
+  chunkIndex: number;
+  chunkCount: number;
+  iv: string;
+  ciphertext: string;
+}
+
 export interface VaultAdmission {
   readonly vaultId: string;
   readonly invitationId: string;
   readonly role: VaultRole;
   readonly authorizationVersion: number;
   readonly activeRoomId: string;
-  readonly senderSessionId: string;
+  /** v1 only; v2 admissions carry no session id */
+  readonly senderSessionId: string | null;
   readonly expiresAt: number | null;
+  readonly protocolVersion: 1 | 2;
 }
 
 export type VaultCapabilityResolver = (
-  request: VaultSocketJoinRequest,
+  request: VaultAnySocketJoinRequest,
 ) => Promise<VaultCapabilityResolution>;
 
 export interface VaultSocket {
@@ -341,6 +388,37 @@ const assertBase64Url = (value: unknown, requiredBytes?: number) => {
   return decoded.length;
 };
 
+export function assertVaultSocketJoinRequestV2(
+  value: unknown,
+): asserts value is VaultSocketJoinRequestV2 {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "protocolVersion",
+      "vaultId",
+      "invitationCapability",
+    ]) ||
+    value.protocolVersion !== VAULT_PROTOCOL_VERSION_V2 ||
+    typeof value.vaultId !== "string" ||
+    !UUID_RE.test(value.vaultId) ||
+    typeof value.invitationCapability !== "string" ||
+    !CAPABILITY_RE.test(value.invitationCapability)
+  ) {
+    throw new VaultServerError("VAULT_CAPABILITY_INVALID");
+  }
+}
+
+/** v1 or v2 join request; unknown versions are rejected without downgrade */
+export function assertVaultAnySocketJoinRequest(
+  value: unknown,
+): asserts value is VaultAnySocketJoinRequest {
+  if (isRecord(value) && value.protocolVersion === VAULT_PROTOCOL_VERSION_V2) {
+    assertVaultSocketJoinRequestV2(value);
+    return;
+  }
+  assertVaultSocketJoinRequest(value);
+}
+
 export function assertVaultSocketJoinRequest(
   value: unknown,
 ): asserts value is VaultSocketJoinRequest {
@@ -370,21 +448,32 @@ export function assertVaultSocketJoinRequest(
   }
 }
 
+const RESOLUTION_KEYS = [
+  "vaultId",
+  "invitationId",
+  "role",
+  "authorizationVersion",
+  "activeRoomId",
+  "snapshotGeneration",
+  "expiresAt",
+] as const;
+
 export function assertVaultCapabilityResolution(
   value: unknown,
   now = Date.now(),
 ): asserts value is VaultCapabilityResolution {
+  const withVersion =
+    isRecord(value) &&
+    Object.prototype.hasOwnProperty.call(value, "protocolVersion");
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, [
-      "vaultId",
-      "invitationId",
-      "role",
-      "authorizationVersion",
-      "activeRoomId",
-      "snapshotGeneration",
-      "expiresAt",
-    ]) ||
+    !hasExactKeys(
+      value,
+      withVersion ? [...RESOLUTION_KEYS, "protocolVersion"] : RESOLUTION_KEYS,
+    ) ||
+    (withVersion &&
+      value.protocolVersion !== VAULT_PROTOCOL_VERSION &&
+      value.protocolVersion !== VAULT_PROTOCOL_VERSION_V2) ||
     typeof value.vaultId !== "string" ||
     !UUID_RE.test(value.vaultId) ||
     typeof value.invitationId !== "string" ||
@@ -450,8 +539,77 @@ export function assertVaultRealtimeEnvelope(
   }
 }
 
+const V2_PURPOSE_OF: Record<string, string> = {
+  "sync.update": "realtime.content",
+  "sync.context": "realtime.request",
+  "sync.snapshot-request": "realtime.request",
+  "presence.ephemeral": "realtime.presence",
+};
+const V2_ENVELOPE_KEYS = [
+  "version",
+  "schemaVersion",
+  "protocolVersion",
+  "vaultId",
+  "roomId",
+  "purpose",
+  "messageType",
+  "messageId",
+  "generation",
+  "chunkIndex",
+  "chunkCount",
+  "iv",
+  "ciphertext",
+] as const;
+const V2_MAX_CHUNKS = 64;
+
+export function assertVaultRealtimeEnvelopeV2(
+  value: unknown,
+): asserts value is VaultRealtimeEnvelopeV2 {
+  if (!isRecord(value) || !hasExactKeys(value, V2_ENVELOPE_KEYS)) {
+    throw new VaultServerError("VAULT_ENVELOPE_INVALID");
+  }
+  if (
+    value.version !== VAULT_PROTOCOL_VERSION_V2 ||
+    value.protocolVersion !== VAULT_PROTOCOL_VERSION_V2 ||
+    value.schemaVersion !== 2
+  ) {
+    throw new VaultServerError("VAULT_PROTOCOL_UNSUPPORTED");
+  }
+  if (
+    typeof value.messageType !== "string" ||
+    !Object.prototype.hasOwnProperty.call(V2_PURPOSE_OF, value.messageType)
+  ) {
+    throw new VaultServerError("VAULT_MESSAGE_TYPE_UNSUPPORTED");
+  }
+  if (
+    // purpose and messageType must match (N20); snapshots never use the socket
+    value.purpose !== V2_PURPOSE_OF[value.messageType] ||
+    typeof value.vaultId !== "string" ||
+    !UUID_RE.test(value.vaultId) ||
+    typeof value.roomId !== "string" ||
+    !ACTIVE_ROOM_ID_RE.test(value.roomId) ||
+    typeof value.messageId !== "string" ||
+    !UUID_V4_RE.test(value.messageId) ||
+    !isSafeIntegerAtLeast(value.generation, 0) ||
+    !isSafeIntegerAtLeast(value.chunkCount, 1) ||
+    (value.chunkCount as number) > V2_MAX_CHUNKS ||
+    !isSafeIntegerAtLeast(value.chunkIndex, 0) ||
+    (value.chunkIndex as number) >= (value.chunkCount as number)
+  ) {
+    throw new VaultServerError("VAULT_ENVELOPE_INVALID");
+  }
+  assertBase64Url(value.iv, 12);
+  if (assertBase64Url(value.ciphertext) < 16) {
+    throw new VaultServerError("VAULT_ENVELOPE_INVALID");
+  }
+}
+
 const canRoleSend = (role: VaultRole, messageType: VaultMessageType) =>
   role === "editor" || messageType === "realtime.presence";
+
+/** W2 S-5: content only from editors; requests and presence from both */
+const canRoleSendV2 = (role: VaultRole, purpose: string) =>
+  role === "editor" || purpose !== "realtime.content";
 
 const payloadByteLength = (value: unknown) => {
   try {
@@ -617,11 +775,17 @@ export class VaultRoomServer {
     }
     this.joiningSockets.add(socket);
     try {
-      assertVaultSocketJoinRequest(value);
+      assertVaultAnySocketJoinRequest(value);
       const resolution = await this.resolver(value);
       assertVaultCapabilityResolution(resolution, this.now());
       if (resolution.vaultId !== value.vaultId) {
         throw new VaultServerError("VAULT_CAPABILITY_INVALID");
+      }
+      // S-2: a room never mixes protocols; the Vault's version decides
+      const vaultProtocol =
+        resolution.protocolVersion ?? VAULT_PROTOCOL_VERSION;
+      if (vaultProtocol !== value.protocolVersion) {
+        throw new VaultServerError("VAULT_PROTOCOL_UNSUPPORTED");
       }
       if (this.hasApplicationRoom(socket)) {
         throw new VaultServerError("VAULT_CAPABILITY_FORBIDDEN");
@@ -638,8 +802,12 @@ export class VaultRoomServer {
         role: resolution.role,
         authorizationVersion: resolution.authorizationVersion,
         activeRoomId: resolution.activeRoomId,
-        senderSessionId: value.senderSessionId,
+        senderSessionId:
+          value.protocolVersion === VAULT_PROTOCOL_VERSION
+            ? value.senderSessionId
+            : null,
         expiresAt: resolution.expiresAt,
+        protocolVersion: value.protocolVersion,
       });
       await socket.join(vaultRoomName(admission.activeRoomId));
       this.admissions.set(socket, admission);
@@ -672,23 +840,37 @@ export class VaultRoomServer {
       if (roomId !== admission.activeRoomId) {
         throw new VaultServerError("VAULT_CAPABILITY_FORBIDDEN");
       }
-      assertVaultRealtimeEnvelope(value);
-      if (
-        value.vaultId !== admission.vaultId ||
-        value.senderSessionId !== admission.senderSessionId ||
-        !canRoleSend(admission.role, value.messageType)
-      ) {
-        throw new VaultServerError("VAULT_CAPABILITY_FORBIDDEN");
+      let outgoing: Record<string, unknown>;
+      if (admission.protocolVersion === VAULT_PROTOCOL_VERSION_V2) {
+        assertVaultRealtimeEnvelopeV2(value);
+        if (
+          value.vaultId !== admission.vaultId ||
+          value.roomId !== admission.activeRoomId ||
+          !canRoleSendV2(admission.role, value.purpose)
+        ) {
+          throw new VaultServerError("VAULT_CAPABILITY_FORBIDDEN");
+        }
+        // S-4: the relay frame carries no socket or session identifiers
+        outgoing = { envelope: value };
+      } else {
+        assertVaultRealtimeEnvelope(value);
+        if (
+          value.vaultId !== admission.vaultId ||
+          value.senderSessionId !== admission.senderSessionId ||
+          !canRoleSend(admission.role, value.messageType)
+        ) {
+          throw new VaultServerError("VAULT_CAPABILITY_FORBIDDEN");
+        }
+        outgoing = {
+          sourceSocketId: socket.id,
+          admittedSenderSessionId: admission.senderSessionId,
+          envelope: value,
+        };
       }
       const bytes = payloadByteLength(value);
       if (bytes > this.maxPayloadBytes) {
         throw new VaultServerError("VAULT_PAYLOAD_TOO_LARGE");
       }
-      const outgoing = {
-        sourceSocketId: socket.id,
-        admittedSenderSessionId: admission.senderSessionId,
-        envelope: value,
-      };
       const broadcaster = volatile
         ? socket.volatile.broadcast.to(vaultRoomName(admission.activeRoomId))
         : socket.broadcast.to(vaultRoomName(admission.activeRoomId));
@@ -870,6 +1052,7 @@ export class VaultRoomServer {
 }
 
 const SUPABASE_RESOLVE_PATH = "/rest/v1/rpc/resolve_vault_capability";
+const SUPABASE_RESOLVE_V2_PATH = "/rest/v1/rpc/resolve_vault_capability_v2";
 const MAX_RESOLVER_RESPONSE_BYTES = 64 * 1024;
 const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
@@ -1035,10 +1218,13 @@ export const createSupabaseVaultCapabilityResolver = (
   ) {
     throw new VaultServerError("VAULT_PERSISTENCE_UNAVAILABLE");
   }
+  const urlV2 = new URL(url.toString());
+  urlV2.pathname = SUPABASE_RESOLVE_V2_PATH;
   return async (request) => {
-    assertVaultSocketJoinRequest(request);
+    assertVaultAnySocketJoinRequest(request);
     const response = await requestSupabaseResolution(
-      url,
+      // v2 joins use the resolver that also returns the Vault's protocol version
+      request.protocolVersion === VAULT_PROTOCOL_VERSION_V2 ? urlV2 : url,
       {
         p_vault_id: request.vaultId,
         p_capability: request.invitationCapability,

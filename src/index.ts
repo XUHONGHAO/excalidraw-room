@@ -12,8 +12,8 @@ import {
   issueVaultRoomProvision,
   parseVaultAllowedOrigins,
   VAULT_DEPLOYMENT_VERSION,
-  VAULT_PROTOCOL_VERSION,
   VAULT_ROOM_SERVER_VERSION,
+  VAULT_SUPPORTED_PROTOCOL_VERSIONS,
   VaultRoomServer,
   VaultServerError,
 } from "./vault";
@@ -135,7 +135,7 @@ app.get("/vault/capabilities", (req, res) => {
   res.json({
     deploymentVersion: VAULT_DEPLOYMENT_VERSION,
     roomServerVersion: VAULT_ROOM_SERVER_VERSION,
-    protocolVersions: [VAULT_PROTOCOL_VERSION],
+    protocolVersions: [...VAULT_SUPPORTED_PROTOCOL_VERSIONS],
   });
 });
 

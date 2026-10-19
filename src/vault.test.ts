@@ -19,6 +19,8 @@ import {
   VaultServerError,
 } from "./vault";
 
+import { runVaultV2Tests } from "./vault-v2.test";
+
 import type { VaultCapabilityResolver, VaultSocket } from "./vault";
 
 const vaultId = "123e4567-e89b-42d3-a456-426614174000";
@@ -729,6 +731,7 @@ async function run() {
   await testRoomContracts();
   await testLongExpiryAndImmediateExpiry();
   await testRateAndConnectionLimits();
+  await runVaultV2Tests();
 }
 
 void run().then(() => {
